@@ -11,6 +11,7 @@ import (
 	"github.com/aws/aws-sdk-go/service/s3"
 	"github.com/aws/aws-sdk-go/service/ses"
 	"github.com/barnybug/cli53"
+	"github.com/miekg/dns"
 	"github.com/pkg/errors"
 	"io/ioutil"
 	"log"
@@ -147,15 +148,55 @@ func recentBackup(c Config, sess *session.Session, domainName string) (string, e
 	return string(d), nil
 }
 
+func entries(bind string) []dns.RR {
+	var records []dns.RR
+	zp := dns.NewZoneParser(strings.NewReader(bind), "", "")
+	for rr, ok := zp.Next(); ok; rr, ok = zp.Next() {
+		records = append(records, rr)
+	}
+	sort.Slice(records, func(i, j int) bool {
+		return strings.Compare(records[i].String(), records[j].String()) > 0
+	})
+	return records
+}
+
 func hasChanged(previousBackup, currentBackup string) (bool) {
-	if len(previousBackup) == 0 {
-		return true
+	prevRecords := entries(previousBackup)
+	currentRecords := entries(currentBackup)
+
+	if len(prevRecords) != len(currentRecords) {
+		return true;
 	}
-	if strings.Compare(previousBackup, currentBackup) == 0 {
-		return false
-	} else {
-		return true
+	for i, pr := range prevRecords {
+		if strings.Compare(pr.String(), currentRecords[i].String()) != 0 {
+			return true
+		}
 	}
+	return false
+}
+
+func changes(previousBackup, currentBackup string) ([]string) {
+	var changedRecords []string
+	prevRecords := entries(previousBackup)
+	currentRecords := entries(currentBackup)
+	existing := make(map[string]bool)
+	for _, r := range prevRecords {
+		existing[r.String()] = true
+	}
+	for _, r := range currentRecords {
+		_, e := existing[r.String()]
+		if !e {
+			changedRecords = append(changedRecords, r.String())
+		}
+	}
+	return changedRecords
+}
+
+func notify(config Config, sesClient *ses.SES, message string, header string) error {
+	notificationDestination := new(ses.Destination)
+	notificationDestination.ToAddresses = []*string{&config.EmailNotification.To}
+	_, err := sesClient.SendEmail(&ses.SendEmailInput{Destination: notificationDestination, Source: &config.EmailNotification.From, Message: &ses.Message{Body: &ses.Body{Text: &ses.Content{Charset: aws.String("UTF-8"), Data: &message}}, Subject: &ses.Content{Charset: aws.String("UTF-8"), Data: &header}}})
+	return err
 }
 
 func export() (error) {
@@ -192,10 +233,9 @@ func export() (error) {
 				if err != nil {
 					return errors.Wrap(err, fmt.Sprintf("issue: failed to upload backup to bucket %s key %s", config.S3Location.Bucket, filename))
 				}
-				notificationDestination := new(ses.Destination)
-				notificationDestination.ToAddresses = []*string{&config.EmailNotification.To}
-				notificationMessage := fmt.Sprintf("Changes detected to Route53 records. The following are the new records \n %s", string(buffer.Bytes()))
-				_, err = sesClient.SendEmail(&ses.SendEmailInput{Destination: notificationDestination, Source: &config.EmailNotification.From, Message: &ses.Message{Body: &ses.Body{Text: &ses.Content{Charset: aws.String("UTF-8"), Data: &notificationMessage}}, Subject: &ses.Content{Charset: aws.String("UTF-8"), Data: aws.String(fmt.Sprintf("ROUTE53 BACKUP FOR DOMAIN %s", *hostedZone.Name))}}})
+				notificationMessage := fmt.Sprintf("The following records have been updated since the last backup \n %s", strings.Join(changes(previousBackup, string(buffer.Bytes())), "\n"))
+				fmt.Println(notificationMessage)
+				err = notify(config, sesClient, notificationMessage, fmt.Sprintf("ROUTE53 BACKUP FOR DOMAIN %s", *hostedZone.Name))
 				if err != nil {
 					return errors.Wrap(err, fmt.Sprintf("issue: failed to send notification email to %s", config.EmailNotification.To))
 				}
@@ -209,6 +249,4 @@ func export() (error) {
 
 func main() {
 	lambda.Start(Handler)
-
-
 }
